@@ -58,7 +58,7 @@ OWNER_ID=        # ваш числовой Telegram ID
 DB_PATH=data/knowledge.db
 LLM_API_KEY=     # ключ DeepSeek (или OpenAI); если пусто — работает fallback
 LLM_BASE_URL=https://api.deepseek.com
-LLM_MODEL=deepseek-chat
+LLM_MODEL=deepseek-v4-flash
 ```
 
 Свой Telegram ID можно узнать у бота [@userinfobot](https://t.me/userinfobot).

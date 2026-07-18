@@ -2,9 +2,24 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from .db import get_connection
+
+# Слова, которые не несут смысла при поиске.
+_SEARCH_STOPWORDS = {
+    "и", "или", "для", "по", "на", "в", "во", "с", "со", "а", "но", "как",
+    "что", "кто", "это", "его", "её", "их", "мне", "мой", "она", "они",
+    "какие", "какой", "какая", "где", "когда", "почему", "есть", "быть",
+    "the", "and", "for", "with", "what", "who", "how", "are", "is",
+}
+
+
+def _tokenize(text: str) -> list[str]:
+    """Разбить запрос на значимые слова (без стоп-слов и коротких токенов)."""
+    words = re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", text.lower())
+    return [w for w in words if len(w) >= 3 and w not in _SEARCH_STOPWORDS]
 
 
 @dataclass
@@ -16,25 +31,39 @@ class KnowledgeItem:
 
 
 async def search_knowledge(text: str, limit: int = 5) -> list[KnowledgeItem]:
-    """Поиск записей по ключевым словам, заголовку и содержимому (LIKE).
+    """Поиск релевантных записей по словам запроса с ранжированием.
 
-    Простой полнотекстовый поиск через LIKE — задел под FTS5 в будущем.
+    Запрос разбивается на слова; ищутся записи, содержащие хотя бы одно из них
+    в ключевых словах, заголовке или тексте. Результаты сортируются по числу
+    совпавших слов (релевантности). Задел под FTS5 в будущем.
     """
-    pattern = f"%{text.strip()}%"
+    words = _tokenize(text)
+    if not words:
+        stripped = text.strip().lower()
+        if not stripped:
+            return []
+        words = [stripped]
+
+    conditions = " OR ".join(
+        ["lower(keywords || ' ' || title || ' ' || content) LIKE ?"] * len(words)
+    )
+    params = [f"%{w}%" for w in words]
+
     async with get_connection() as db:
         cursor = await db.execute(
-            """
-            SELECT id, keywords, title, content
-            FROM knowledge
-            WHERE keywords LIKE ? OR title LIKE ? OR content LIKE ?
-            ORDER BY id
-            LIMIT ?
-            """,
-            (pattern, pattern, pattern, limit),
+            f"SELECT id, keywords, title, content FROM knowledge WHERE {conditions}",
+            params,
         )
         rows = await cursor.fetchall()
 
-    return [KnowledgeItem(id=r[0], keywords=r[1], title=r[2], content=r[3]) for r in rows]
+    scored: list[tuple[int, KnowledgeItem]] = []
+    for r in rows:
+        haystack = f"{r[1]} {r[2]} {r[3]}".lower()
+        score = sum(1 for w in words if w in haystack)
+        scored.append((score, KnowledgeItem(id=r[0], keywords=r[1], title=r[2], content=r[3])))
+
+    scored.sort(key=lambda pair: (pair[0], -pair[1].id), reverse=True)
+    return [item for _, item in scored[:limit]]
 
 
 async def log_query(user_id: int, query: str, found: bool) -> None:

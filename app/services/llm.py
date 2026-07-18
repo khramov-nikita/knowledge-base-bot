@@ -1,7 +1,8 @@
 """Интеграция с LLM (DeepSeek, OpenAI-совместимый API).
 
-Если ключ LLM не задан или запрос к API завершился ошибкой, возвращается
-безопасный fallback-ответ, чтобы бот не падал и запрос был зафиксирован.
+Модель отвечает на вопрос пользователя, опираясь на переданные фрагменты базы
+знаний (схема RAG). Если ключ LLM не задан или запрос к API завершился ошибкой,
+функция возвращает None — вызывающий код сам решает, что показать пользователю.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ import logging
 
 from openai import AsyncOpenAI
 
+from app.services import guardrails
 from config import load_config
 
 logger = logging.getLogger(__name__)
@@ -19,16 +21,27 @@ NO_ANSWER_TEXT = (
     "Ваш запрос зафиксирован — владелец скоро дополнит базу."
 )
 
-SYSTEM_PROMPT = (
-    "Ты — бот-консультант по базе знаний компании. "
-    "Отвечай кратко, вежливо и по делу на русском языке. "
-    "Если не уверен в ответе, честно сообщи об этом и не выдумывай факты."
-)
+# Сигнал модели о том, что ответа в предоставленных данных нет.
+NO_ANSWER_SIGNAL = "NO_ANSWER"
+
+
+def is_no_answer(text: str | None) -> bool:
+    """Проверить, сообщила ли модель об отсутствии ответа (сигнал NO_ANSWER)."""
+    if not text:
+        return False
+    normalized = text.strip().strip(".!").upper()
+    return normalized == NO_ANSWER_SIGNAL or normalized.startswith(NO_ANSWER_SIGNAL)
+
+# Системный промпт и усиливающее сообщение живут в guardrails (единый источник).
+SYSTEM_PROMPT = guardrails.SYSTEM_PROMPT
+_INJECTION_REMINDER = guardrails.INJECTION_REMINDER
 
 # Таймаут запроса к LLM в секундах.
 _REQUEST_TIMEOUT = 30.0
-# Ограничение длины истории диалога, передаваемой в модель.
-_CONTEXT_LIMIT = 6
+# Сколько последних сообщений диалога передавать модели.
+_CONTEXT_LIMIT = 20
+# Ограничение длины ответа (для коротких и конкретных ответов).
+_MAX_TOKENS = 300
 
 _config = load_config()
 _client: AsyncOpenAI | None = None
@@ -39,35 +52,74 @@ if _config.llm_api_key:
         timeout=_REQUEST_TIMEOUT,
     )
 else:
-    logger.warning("LLM_API_KEY не задан — LLM отключён, используется fallback-ответ.")
+    logger.warning("LLM_API_KEY не задан — LLM отключён, ответы берутся из базы напрямую.")
 
 
-async def ask(query: str, context: list[str] | None = None) -> str:
-    """Сгенерировать ответ на запрос через LLM.
+def is_enabled() -> bool:
+    """Доступна ли генерация через LLM (задан ли ключ)."""
+    return _client is not None
+
+
+async def answer(
+    query: str,
+    knowledge: list[str],
+    history: list[dict[str, str]] | None = None,
+) -> str | None:
+    """Сгенерировать ответ на основе фрагментов базы знаний (RAG).
 
     Args:
-        query: текст запроса пользователя.
-        context: предыдущие запросы пользователя для контекста уточнений.
+        query: вопрос пользователя.
+        knowledge: релевантные фрагменты базы знаний для опоры.
+        history: предыдущие сообщения диалога в виде {"role": ..., "content": ...}
+            (роли "user"/"assistant") для памяти уточняющих вопросов.
 
     Returns:
-        Ответ модели либо безопасный fallback-текст при отсутствии ключа/ошибке.
+        Ответ модели, либо None если LLM недоступен или произошла ошибка.
     """
     if _client is None:
-        return NO_ANSWER_TEXT
+        return None
 
-    messages: list[dict[str, str]] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for prev in (context or [])[-_CONTEXT_LIMIT:]:
-        messages.append({"role": "user", "content": prev})
-    messages.append({"role": "user", "content": query})
+    knowledge_block = "\n\n---\n\n".join(knowledge) if knowledge else "(нет данных)"
+    messages: list[dict[str, str]] = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {
+            "role": "system",
+            "content": "Фрагменты базы знаний:\n\n" + knowledge_block,
+        },
+    ]
+
+    # Guardrail: при подозрении на инъекцию усиливаем инструкции.
+    if guardrails.detect_injection(query):
+        logger.warning("Обнаружена возможная промпт-инъекция в запросе.")
+        messages.append({"role": "system", "content": _INJECTION_REMINDER})
+
+    # Память диалога: последние сообщения. Пользовательские — как недоверенные данные.
+    for msg in (history or [])[-_CONTEXT_LIMIT:]:
+        content = msg.get("content", "")
+        if not content:
+            continue
+        if msg.get("role") == "assistant":
+            messages.append({"role": "assistant", "content": content})
+        else:
+            messages.append({"role": "user", "content": guardrails.wrap_user_input(content)})
+
+    messages.append({"role": "user", "content": guardrails.wrap_user_input(query)})
 
     try:
         response = await _client.chat.completions.create(
             model=_config.llm_model,
             messages=messages,
+            max_tokens=_MAX_TOKENS,
+            temperature=0.3,
         )
     except Exception:  # noqa: BLE001 — любая ошибка API не должна ронять обработку
         logger.exception("Ошибка запроса к LLM")
-        return NO_ANSWER_TEXT
+        return None
 
-    answer = (response.choices[0].message.content or "").strip()
-    return answer or NO_ANSWER_TEXT
+    result = (response.choices[0].message.content or "").strip()
+
+    # Выходной фильтр: не допускаем утечку системного промпта/инструкций.
+    filtered = guardrails.filter_output(result)
+    if filtered is None and result:
+        logger.warning("Ответ модели заблокирован выходным фильтром (утечка/пусто).")
+    return filtered

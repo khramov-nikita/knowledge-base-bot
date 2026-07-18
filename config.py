@@ -18,6 +18,7 @@ class ConfigError(RuntimeError):
 class Config:
     bot_token: str
     owner_id: int
+    owner_contact: str
     db_path: str
     llm_api_key: str | None
     llm_base_url: str
@@ -43,14 +44,16 @@ def load_config() -> Config:
     except ValueError as exc:
         raise ConfigError("OWNER_ID должен быть числом (Telegram ID владельца).") from exc
 
+    owner_contact = os.getenv("OWNER_CONTACT", "@OnickieO")
     db_path = os.getenv("DB_PATH", "data/knowledge.db")
     llm_api_key = os.getenv("LLM_API_KEY") or None
     llm_base_url = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")
-    llm_model = os.getenv("LLM_MODEL", "deepseek-chat")
+    llm_model = os.getenv("LLM_MODEL", "deepseek-v4-flash")
 
     return Config(
         bot_token=bot_token,
         owner_id=owner_id,
+        owner_contact=owner_contact,
         db_path=db_path,
         llm_api_key=llm_api_key,
         llm_base_url=llm_base_url,

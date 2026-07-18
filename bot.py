@@ -24,6 +24,7 @@ async def main() -> None:
 
     config = load_config()
     runtime.set_owner_id(config.owner_id)
+    runtime.set_owner_contact(config.owner_contact)
 
     db.configure(config.db_path)
     await db.init_db()
