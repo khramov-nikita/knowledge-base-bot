@@ -36,31 +36,20 @@ _HISTORY_KEY = "history"
 _HISTORY_LIMIT = 20
 
 
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer(
-        "Здравствуйте! " + HELP_TEXT,
-        reply_markup=main_menu(),
-    )
-
-
 def _short_title(title: str) -> str:
-    """Короткий заголовок: без хвостовой скобки и без префиксов через ': '.
-
-    Примеры:
-        'База знаний: ФИО: Опыт работы (Общий стаж: ~8 лет)' -> 'Опыт работы'
-        'Портфолио проектов: Сборка лендинга (Landing Page)' -> 'Сборка лендинга'
-    """
+    """Короткий заголовок: без хвостовой скобки и без префиксов через ': '."""
     cleaned = re.sub(r"\s*\([^)]*\)\s*$", "", title).strip()
     return cleaned.split(": ")[-1].strip() or title
 
 
 def _context_title(title: str) -> str:
     """Заголовок для LLM: без длинных префиксов, но с важными скобками (стаж и т.п.)."""
-    # Сохраняем хвост в скобках, если там стаж/годы — иначе модель теряет итог.
     paren = ""
-    match = re.search(r"(\s*\([^)]*(?:стаж|лет|год|месяц)[^)]*\))\s*$", title, re.IGNORECASE)
+    match = re.search(
+        r"(\s*\([^)]*(?:стаж|лет|год|месяц)[^)]*\))\s*$",
+        title,
+        re.IGNORECASE,
+    )
     if match:
         paren = match.group(1)
         title = title[: match.start()].rstrip()
@@ -106,7 +95,6 @@ def _services_summary(items: list[queries.KnowledgeItem]) -> str:
     seen: set[str] = set()
     for item in items:
         title = _short_title(item.title)
-        # Сводный раздел «Стоимость услуг» уже содержит весь прайс — берём его строки.
         if "стоимость" in title.lower() or "прайс" in title.lower() or "цена" in title.lower():
             for line in item.content.splitlines():
                 if "₽" in line or re.search(r"\d[\d\s]*000", line):
@@ -122,13 +110,12 @@ def _services_summary(items: list[queries.KnowledgeItem]) -> str:
             lines.append(f"• {label}" if price else f"• {title}")
             seen.add(label)
     if len(lines) == 1:
-        return _plain_items(items[:3])
+        return "\n\n".join(f"{_short_title(i.title)}\n{i.content}" for i in items[:3])
     return "\n".join(lines)
 
 
 def _formatted_items(items: list[queries.KnowledgeItem]) -> str:
     """HTML-представление записей базы (fallback, когда LLM недоступен)."""
-    # Для нескольких записей не выгружаем простыни — краткий список.
     if len(items) > 1:
         return md_to_telegram_html(_services_summary(items))
     return "\n\n".join(
@@ -144,9 +131,21 @@ def _plain_items(items: list[queries.KnowledgeItem]) -> str:
     return "\n\n".join(f"{_short_title(item.title)}\n{item.content}" for item in items)
 
 
-@router.message(Command("help"))
-@router.message(F.text == BTN_HELP)
-async def cmd_help(message: Message) -> None:
+async def _safe_answer(message: Message, text: str) -> None:
+    """Отправить ответ, при ошибке разбора HTML — повторить без форматирования."""
+    try:
+        await message.answer(text)
+    except TelegramBadRequest:
+        logger.warning("Ошибка HTML-разметки, отправляю без форматирования.")
+        plain = re.sub(r"<[^>]+>", "", text)
+        await message.answer(plain, parse_mode=None)
+
+
+def _owner_id() -> int:
+    return runtime.OWNER_ID
+
+
+async def _send_help(message: Message) -> None:
     items = await queries.list_knowledge(limit=50)
     text = HELP_TEXT
     if items:
@@ -157,11 +156,10 @@ async def cmd_help(message: Message) -> None:
     await message.answer(text)
 
 
-@router.message(F.text == BTN_CONTACT_HUMAN)
-async def contact_human(message: Message) -> None:
-    """Кнопка «Связаться с человеком»: уведомляем владельца, шлём контакты."""
+async def _send_contact_human(message: Message) -> None:
+    """Уведомляем владельца (если это не он сам) и отправляем контакты пользователю."""
     user = message.from_user
-    if user is not None:
+    if user is not None and user.id != runtime.OWNER_ID:
         await notify_contact_request(
             message.bot,
             runtime.OWNER_ID,
@@ -177,21 +175,17 @@ async def contact_human(message: Message) -> None:
     )
 
 
-@router.message(F.text)
-async def handle_query(message: Message, state: FSMContext) -> None:
-    """Основной обработчик текстовых запросов (Сценарии 1-3)."""
-    query = (message.text or "").strip()
-    if not query:
-        return
-
+async def _handle_knowledge_query(
+    message: Message,
+    state: FSMContext,
+    query: str,
+) -> None:
+    """Обработка текстовых запросов к базе знаний (Сценарии 1-3)."""
     user_id = message.from_user.id if message.from_user else 0
 
-    # Память диалога: список сообщений {"role", "content"} для контекста уточнений.
     data = await state.get_data()
     history: list[dict[str, str]] = data.get(_HISTORY_KEY, [])
 
-    # В LLM уходят только релевантные фрагменты (не вся БД).
-    # Для обобщающих вопросов (среднее, прайс) подмешиваются разделы про цены.
     targeted = await queries.search_knowledge(query)
     context_items = await queries.select_context_for_query(query)
 
@@ -209,27 +203,29 @@ async def handle_query(message: Message, state: FSMContext) -> None:
             await _safe_answer(message, md_to_telegram_html(llm_answer))
             answered = True
         elif llm_answer is None and context_items:
-            # Ошибка LLM / ответ-выгрузка отфильтрован — краткий список, не простыни.
-            reply_text = _services_summary(context_items) if len(context_items) > 1 else _plain_items(context_items)
+            reply_text = (
+                _services_summary(context_items)
+                if len(context_items) > 1
+                else _plain_items(context_items)
+            )
             await _safe_answer(
                 message,
-                md_to_telegram_html(reply_text) if len(context_items) > 1 else _formatted_items(context_items),
+                md_to_telegram_html(reply_text)
+                if len(context_items) > 1
+                else _formatted_items(context_items),
             )
             answered = True
     elif targeted:
-        # LLM выключен, но есть точное совпадение — отдаём содержимое базы.
         reply_text = _plain_items(targeted)
         await _safe_answer(message, _formatted_items(targeted))
         answered = True
 
     if not answered:
         if guardrails.detect_injection(query):
-            # Попытка обойти инструкции без ответа — вежливый отказ, владельца не беспокоим.
             logger.warning("Промпт-инъекция без ответа — отказ.")
             reply_text = guardrails.REFUSAL_TEXT
             await message.answer(reply_text)
         else:
-            # Сценарий 3: ответа нет — фиксируем и уведомляем владельца.
             await queries.log_unanswered(user_id, query)
             await notify_unanswered(message.bot, _owner_id(), user_id, query)
             reply_text = llm.NO_ANSWER_TEXT
@@ -242,16 +238,33 @@ async def handle_query(message: Message, state: FSMContext) -> None:
     await state.update_data({_HISTORY_KEY: history[-_HISTORY_LIMIT:]})
 
 
-async def _safe_answer(message: Message, text: str) -> None:
-    """Отправить ответ, при ошибке разбора HTML — повторить без форматирования."""
-    try:
-        await message.answer(text)
-    except TelegramBadRequest:
-        logger.warning("Ошибка HTML-разметки, отправляю без форматирования.")
-        plain = re.sub(r"<[^>]+>", "", text)
-        await message.answer(plain, parse_mode=None)
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer(
+        "Здравствуйте! " + HELP_TEXT,
+        reply_markup=main_menu(),
+    )
 
 
-def _owner_id() -> int:
-    """Получить ID владельца из глобальной конфигурации, установленной в bot.py."""
-    return runtime.OWNER_ID
+@router.message(Command("help"))
+async def cmd_help(message: Message) -> None:
+    await _send_help(message)
+
+
+@router.message(F.text)
+async def dispatch_text(message: Message, state: FSMContext) -> None:
+    """Единая точка входа для всего текста — один ответ на одно сообщение."""
+    query = (message.text or "").strip()
+    if not query or query.startswith("/"):
+        return
+
+    if query == BTN_HELP:
+        await _send_help(message)
+        return
+
+    if query == BTN_CONTACT_HUMAN:
+        await _send_contact_human(message)
+        return
+
+    await _handle_knowledge_query(message, state, query)
