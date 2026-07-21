@@ -44,7 +44,7 @@ def load_config() -> Config:
     except ValueError as exc:
         raise ConfigError("OWNER_ID должен быть числом (Telegram ID владельца).") from exc
 
-    owner_contact = os.getenv("OWNER_CONTACT", "@OnickieO")
+    owner_contact = os.getenv("OWNER_CONTACT", "")
     db_path = os.getenv("DB_PATH", "data/knowledge.db")
     llm_api_key = os.getenv("LLM_API_KEY") or None
     llm_base_url = os.getenv("LLM_BASE_URL", "https://api.deepseek.com")

@@ -63,7 +63,7 @@ pip install -r requirements.txt
 ```
 BOT_TOKEN=          # токен от @BotFather
 OWNER_ID=           # числовой Telegram ID владельца
-OWNER_CONTACT=@OnickieO   # контакты для кнопки «Связаться с человеком»
+OWNER_CONTACT=      # например @username — для кнопки «Связаться с человеком»
 DB_PATH=data/knowledge.db
 LLM_API_KEY=        # ключ DeepSeek; если пусто — fallback без генерации
 LLM_BASE_URL=https://api.deepseek.com
