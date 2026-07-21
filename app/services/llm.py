@@ -40,8 +40,21 @@ _INJECTION_REMINDER = guardrails.INJECTION_REMINDER
 _REQUEST_TIMEOUT = 30.0
 # Сколько последних сообщений диалога передавать модели.
 _CONTEXT_LIMIT = 20
-# Ограничение длины ответа (для коротких и конкретных ответов).
-_MAX_TOKENS = 300
+# Лимит токенов ответа: обычный / развёрнутый (для «подробнее»).
+_MAX_TOKENS = 600
+_MAX_TOKENS_DETAILED = 1200
+
+
+def wants_detailed_answer(query: str) -> bool:
+    """Нужен ли более длинный ответ (подробный рассказ)."""
+    lowered = query.lower()
+    return any(
+        marker in lowered
+        for marker in (
+            "подробн", "расскажи", "рассказать", "опиши", "исполнител",
+            "резюме", "профиль", "обо мне", "о себе",
+        )
+    )
 
 _config = load_config()
 _client: AsyncOpenAI | None = None
@@ -106,10 +119,11 @@ async def answer(
     messages.append({"role": "user", "content": guardrails.wrap_user_input(query)})
 
     try:
+        max_tokens = _MAX_TOKENS_DETAILED if wants_detailed_answer(query) else _MAX_TOKENS
         response = await _client.chat.completions.create(
             model=_config.llm_model,
             messages=messages,
-            max_tokens=_MAX_TOKENS,
+            max_tokens=max_tokens,
             temperature=0.3,
         )
     except Exception:  # noqa: BLE001 — любая ошибка API не должна ронять обработку

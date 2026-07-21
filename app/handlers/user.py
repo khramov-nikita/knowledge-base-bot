@@ -56,8 +56,81 @@ def _short_title(title: str) -> str:
     return cleaned.split(": ")[-1].strip() or title
 
 
+def _context_title(title: str) -> str:
+    """Заголовок для LLM: без длинных префиксов, но с важными скобками (стаж и т.п.)."""
+    # Сохраняем хвост в скобках, если там стаж/годы — иначе модель теряет итог.
+    paren = ""
+    match = re.search(r"(\s*\([^)]*(?:стаж|лет|год|месяц)[^)]*\))\s*$", title, re.IGNORECASE)
+    if match:
+        paren = match.group(1)
+        title = title[: match.start()].rstrip()
+    short = title.split(": ")[-1].strip() or title
+    return f"{short}{paren}".strip()
+
+
+def _extract_price_line(content: str) -> str:
+    """Достать строку со стоимостью из текста записи, если есть."""
+    for line in content.splitlines():
+        stripped = line.strip()
+        if re.search(r"(стоимость|цена|₽|\d[\d\s]*000)", stripped, re.IGNORECASE):
+            return re.sub(r"^\*\*?|\*\*?$", "", stripped).strip()
+    return ""
+
+
+def _compact_knowledge(
+    items: list[queries.KnowledgeItem],
+    *,
+    detailed: bool = False,
+) -> list[str]:
+    """Краткое представление записей для LLM: заголовок + цена/начало, без простыней."""
+    chunks: list[str] = []
+    line_limit = 12 if detailed else 2
+    char_limit = 1200 if detailed else 280
+    for item in items:
+        title = _context_title(item.title)
+        price = _extract_price_line(item.content)
+        if price and not detailed:
+            chunks.append(f"{title}\n{price}")
+            continue
+        lines = [ln.strip() for ln in item.content.splitlines() if ln.strip()][:line_limit]
+        body = "\n".join(lines)
+        if len(body) > char_limit:
+            body = body[:char_limit].rstrip() + "…"
+        chunks.append(f"{title}\n{body}")
+    return chunks
+
+
+def _services_summary(items: list[queries.KnowledgeItem]) -> str:
+    """Короткий список услуг с ценами (безопасный fallback без выгрузки разделов)."""
+    lines: list[str] = ["Предоставляемые услуги:"]
+    seen: set[str] = set()
+    for item in items:
+        title = _short_title(item.title)
+        # Сводный раздел «Стоимость услуг» уже содержит весь прайс — берём его строки.
+        if "стоимость" in title.lower() or "прайс" in title.lower() or "цена" in title.lower():
+            for line in item.content.splitlines():
+                if "₽" in line or re.search(r"\d[\d\s]*000", line):
+                    clean = re.sub(r"^[-*•]\s*", "", line.strip())
+                    clean = re.sub(r"^\*\*?|\*\*?$", "", clean).strip()
+                    if clean and clean not in seen:
+                        lines.append(f"• {clean}")
+                        seen.add(clean)
+            continue
+        price = _extract_price_line(item.content)
+        label = f"{title}" + (f" — {price}" if price else "")
+        if label not in seen and "портфолио" not in title.lower():
+            lines.append(f"• {label}" if price else f"• {title}")
+            seen.add(label)
+    if len(lines) == 1:
+        return _plain_items(items[:3])
+    return "\n".join(lines)
+
+
 def _formatted_items(items: list[queries.KnowledgeItem]) -> str:
     """HTML-представление записей базы (fallback, когда LLM недоступен)."""
+    # Для нескольких записей не выгружаем простыни — краткий список.
+    if len(items) > 1:
+        return md_to_telegram_html(_services_summary(items))
     return "\n\n".join(
         f"{bold(_short_title(item.title))}\n{md_to_telegram_html(item.content)}"
         for item in items
@@ -66,6 +139,8 @@ def _formatted_items(items: list[queries.KnowledgeItem]) -> str:
 
 def _plain_items(items: list[queries.KnowledgeItem]) -> str:
     """Простой текст записей базы для сохранения в память диалога."""
+    if len(items) > 1:
+        return _services_summary(items)
     return "\n\n".join(f"{_short_title(item.title)}\n{item.content}" for item in items)
 
 
@@ -115,25 +190,31 @@ async def handle_query(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     history: list[dict[str, str]] = data.get(_HISTORY_KEY, [])
 
-    # Точный поиск — для fallback без LLM. Для самой LLM передаём всю базу целиком
-    # (она небольшая), чтобы работали вопросы на обобщение: среднее, список, сравнение.
+    # В LLM уходят только релевантные фрагменты (не вся БД).
+    # Для обобщающих вопросов (среднее, прайс) подмешиваются разделы про цены.
     targeted = await queries.search_knowledge(query)
-    all_items = await queries.list_knowledge(limit=50)
+    context_items = await queries.select_context_for_query(query)
 
     reply_text = ""
     answered = False
 
-    if llm.is_enabled() and all_items:
-        knowledge = [f"{item.title}\n{item.content}" for item in all_items]
+    if llm.is_enabled() and context_items:
+        knowledge = _compact_knowledge(
+            context_items,
+            detailed=llm.wants_detailed_answer(query),
+        )
         llm_answer = await llm.answer(query, knowledge, history=history)
         if llm_answer is not None and not llm.is_no_answer(llm_answer):
             reply_text = llm_answer
             await _safe_answer(message, md_to_telegram_html(llm_answer))
             answered = True
-        elif llm_answer is None and targeted:
-            # Ошибка LLM, но точное совпадение есть — отдаём базу напрямую.
-            reply_text = _plain_items(targeted)
-            await _safe_answer(message, _formatted_items(targeted))
+        elif llm_answer is None and context_items:
+            # Ошибка LLM / ответ-выгрузка отфильтрован — краткий список, не простыни.
+            reply_text = _services_summary(context_items) if len(context_items) > 1 else _plain_items(context_items)
+            await _safe_answer(
+                message,
+                md_to_telegram_html(reply_text) if len(context_items) > 1 else _formatted_items(context_items),
+            )
             answered = True
     elif targeted:
         # LLM выключен, но есть точное совпадение — отдаём содержимое базы.
