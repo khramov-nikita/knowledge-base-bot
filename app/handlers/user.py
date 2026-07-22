@@ -66,26 +66,103 @@ def _extract_price_line(content: str) -> str:
     return ""
 
 
+def _line_match_score(line: str, words: list[str]) -> int:
+    """Сколько слов запроса встречается в строке (по полному слову или основе)."""
+    lowered = line.lower()
+    score = 0
+    for word in words:
+        if len(word) < 3:
+            continue
+        if word in lowered:
+            score += 2
+            continue
+        # Грубая основа: отсекаем короткое окончание.
+        stem = word[:-2] if len(word) > 5 else word
+        if len(stem) >= 4 and stem in lowered:
+            score += 1
+    return score
+
+
+def _pick_relevant_lines(
+    content: str,
+    query: str,
+    *,
+    line_limit: int,
+    char_limit: int,
+) -> str:
+    """Взять строки, наиболее полезные для ответа на запрос.
+
+    Сначала предпочитаем строки с совпадением по словам запроса (например,
+    «Развитие навыков…»), иначе — начало раздела.
+    """
+    words = [w.lower() for w in re.findall(r"[0-9A-Za-zА-Яа-яЁё]+", query) if len(w) >= 3]
+    stop = {
+        "какие", "какой", "какая", "были", "было", "есть", "ходе", "этот", "эта",
+        "для", "при", "про", "что", "как", "или",
+    }
+    words = [w for w in words if w not in stop]
+
+    lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+
+    if words:
+        ranked = sorted(
+            (( _line_match_score(ln, words), idx, ln) for idx, ln in enumerate(lines)),
+            key=lambda t: (t[0], -t[1]),
+            reverse=True,
+        )
+        chosen_idx: set[int] = set()
+        for score, idx, _ln in ranked:
+            if score <= 0 and chosen_idx:
+                break
+            if score <= 0:
+                break
+            # Берём совпавшую строку и соседей для контекста.
+            for j in (idx - 1, idx, idx + 1):
+                if 0 <= j < len(lines):
+                    chosen_idx.add(j)
+            if len(chosen_idx) >= line_limit:
+                break
+        if chosen_idx:
+            selected = [lines[i] for i in sorted(chosen_idx)[:line_limit]]
+            body = "\n".join(selected)
+            if len(body) > char_limit:
+                body = body[:char_limit].rstrip() + "…"
+            return body
+
+    body = "\n".join(lines[:line_limit])
+    if len(body) > char_limit:
+        body = body[:char_limit].rstrip() + "…"
+    return body
+
+
 def _compact_knowledge(
     items: list[queries.KnowledgeItem],
+    query: str = "",
     *,
     detailed: bool = False,
 ) -> list[str]:
-    """Краткое представление записей для LLM: заголовок + цена/начало, без простыней."""
+    """Краткое представление записей для LLM с приоритетом строк по запросу."""
     chunks: list[str] = []
-    line_limit = 12 if detailed else 2
-    char_limit = 1200 if detailed else 280
+    line_limit = 16 if detailed else 8
+    char_limit = 1600 if detailed else 700
     for item in items:
         title = _context_title(item.title)
         price = _extract_price_line(item.content)
-        if price and not detailed:
+        # Для ценовых вопросов достаточно строки со стоимостью.
+        if price and not detailed and not any(
+            w in query.lower() for w in ("навык", "опыт", "обязан", "развит", "работ")
+        ):
             chunks.append(f"{title}\n{price}")
             continue
-        lines = [ln.strip() for ln in item.content.splitlines() if ln.strip()][:line_limit]
-        body = "\n".join(lines)
-        if len(body) > char_limit:
-            body = body[:char_limit].rstrip() + "…"
-        chunks.append(f"{title}\n{body}")
+        body = _pick_relevant_lines(
+            item.content,
+            query,
+            line_limit=line_limit,
+            char_limit=char_limit,
+        )
+        chunks.append(f"{title}\n{body}" if body else title)
     return chunks
 
 
@@ -188,6 +265,10 @@ async def _handle_knowledge_query(
 
     targeted = await queries.search_knowledge(query)
     context_items = await queries.select_context_for_query(query)
+    # Если профильный/навыковый вопрос — даём больше строк из разделов.
+    detailed = llm.wants_detailed_answer(query) or any(
+        m in query.lower() for m in ("навык", "опыт", "развит", "обязан", "достижен")
+    )
 
     reply_text = ""
     answered = False
@@ -195,26 +276,22 @@ async def _handle_knowledge_query(
     if llm.is_enabled() and context_items:
         knowledge = _compact_knowledge(
             context_items,
-            detailed=llm.wants_detailed_answer(query),
+            query,
+            detailed=detailed,
         )
         llm_answer = await llm.answer(query, knowledge, history=history)
         if llm_answer is not None and not llm.is_no_answer(llm_answer):
             reply_text = llm_answer
             await _safe_answer(message, md_to_telegram_html(llm_answer))
             answered = True
-        elif llm_answer is None and context_items:
-            reply_text = (
-                _services_summary(context_items)
-                if len(context_items) > 1
-                else _plain_items(context_items)
-            )
-            await _safe_answer(
-                message,
-                md_to_telegram_html(reply_text)
-                if len(context_items) > 1
-                else _formatted_items(context_items),
-            )
-            answered = True
+        elif context_items:
+            # LLM недоступна / вернула NO_ANSWER / ошибка — отвечаем релевантными
+            # строками из базы, а не «ответа нет», если данные есть.
+            snippets = _compact_knowledge(context_items, query, detailed=True)
+            if snippets:
+                reply_text = "\n\n".join(snippets)
+                await _safe_answer(message, md_to_telegram_html(reply_text))
+                answered = True
     elif targeted:
         reply_text = _plain_items(targeted)
         await _safe_answer(message, _formatted_items(targeted))

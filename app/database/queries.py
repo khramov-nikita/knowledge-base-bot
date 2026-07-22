@@ -77,6 +77,7 @@ _SERVICES_HINTS = (
 _PROFILE_HINTS = (
     "исполнител", "резюме", "профиль", "кандидат", "соискател",
     "опыт", "навык", "образован", "о себе", "обо мне", "кто ты", "кто он",
+    "развит", "обязанност", "достижен",
 )
 
 # Маркеры разделов про услуги/цены в заголовке или keywords.
@@ -194,6 +195,13 @@ async def select_context_for_query(text: str, limit: int = 5) -> list[KnowledgeI
     if _is_profile_query(text):
         profile = await _items_by_markers(_PROFILE_SECTION_MARKERS, limit=limit + 3)
         if profile:
+            lowered = text.lower()
+            # Вопросы про навыки/развитие на работе — опыт работы важнее блока навыков.
+            if "работ" in lowered and any(x in lowered for x in ("навык", "развит", "обязан")):
+                profile = sorted(
+                    profile,
+                    key=lambda item: (0 if "опыт" in item.title.lower() else 1),
+                )
             return profile
 
     if _is_services_query(text) or _is_aggregation_query(text):
