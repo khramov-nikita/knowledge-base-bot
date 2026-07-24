@@ -99,10 +99,21 @@ async def list_cart(user_id: int) -> list[CartItem]:
 
 
 async def clear_cart(user_id: int) -> None:
-    """Очистить корзину (для будущего оформления заказа)."""
+    """Очистить корзину пользователя."""
     async with get_connection() as db:
         await db.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
         await db.commit()
+
+
+async def remove_from_cart(user_id: int, cart_item_id: int) -> bool:
+    """Удалить позицию из корзины. False — уже нет / чужой id."""
+    async with get_connection() as db:
+        cursor = await db.execute(
+            "DELETE FROM cart_items WHERE id = ? AND user_id = ?",
+            (cart_item_id, user_id),
+        )
+        await db.commit()
+        return (cursor.rowcount or 0) > 0
 
 
 async def create_order(user_id: int, status: str = "new") -> int:
@@ -133,6 +144,64 @@ async def add_order_items(order_id: int, items: list[OrderItemInput]) -> None:
             ],
         )
         await db.commit()
+
+
+async def checkout_cart(
+    user_id: int,
+    status: str = "ожидает оплаты",
+) -> tuple[int, list[CartItem]] | None:
+    """Оформить заказ из корзины в одной транзакции.
+
+    Возвращает (order_id, позиции) или None, если корзина пуста.
+    """
+    async with get_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT id, user_id, service_id, title, price_text
+            FROM cart_items
+            WHERE user_id = ?
+            ORDER BY id
+            """,
+            (user_id,),
+        )
+        rows = await cursor.fetchall()
+        if not rows:
+            return None
+
+        items = [
+            CartItem(
+                id=r[0],
+                user_id=r[1],
+                service_id=r[2],
+                title=r[3],
+                price_text=r[4] or "",
+            )
+            for r in rows
+        ]
+
+        cursor = await db.execute(
+            "INSERT INTO orders (user_id, status) VALUES (?, ?)",
+            (user_id, status),
+        )
+        order_id = cursor.lastrowid or 0
+        if not order_id:
+            await db.rollback()
+            return None
+
+        await db.executemany(
+            """
+            INSERT INTO order_items
+                (order_id, service_id, title, price_text, quantity)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            [
+                (order_id, item.service_id, item.title, item.price_text, 1)
+                for item in items
+            ],
+        )
+        await db.execute("DELETE FROM cart_items WHERE user_id = ?", (user_id,))
+        await db.commit()
+        return order_id, items
 
 
 async def set_order_status(order_id: int, status: str) -> None:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Protocol
+
 from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -14,6 +16,13 @@ BTN_SHOWCASE = "Витрина"
 BTN_CART = "Корзина"
 BTN_CONTACT_HUMAN = "Связаться с человеком"
 BTN_ADD_TO_CART = "Добавить в корзину"
+BTN_REMOVE = "Убрать"
+BTN_CHECKOUT = "Оформить заказ"
+
+
+class _CartKeyboardItem(Protocol):
+    id: int
+    title: str
 
 
 def main_menu() -> ReplyKeyboardMarkup:
@@ -40,3 +49,29 @@ def add_to_cart_keyboard(item_id: int) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def cart_keyboard(items: list[_CartKeyboardItem]) -> InlineKeyboardMarkup:
+    """Inline-кнопки корзины: «Убрать» у каждой позиции и «Оформить заказ»."""
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in items:
+        label = item.title.strip() or "услуга"
+        if len(label) > 28:
+            label = label[:27] + "…"
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=f"{BTN_REMOVE} · {label}",
+                    callback_data=f"cart:remove:{item.id}",
+                )
+            ]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=BTN_CHECKOUT,
+                callback_data="cart:checkout",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)

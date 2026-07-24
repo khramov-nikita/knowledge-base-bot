@@ -8,16 +8,20 @@ import re
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.types import CallbackQuery, Message, User
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message, User
 
 from app import runtime
 from app.database import persistence, queries
+from app.database.persistence import CartItem
 from app.keyboards import (
     BTN_ADD_TO_CART,
     BTN_CART,
+    BTN_CHECKOUT,
     BTN_CONTACT_HUMAN,
+    BTN_REMOVE,
     BTN_SHOWCASE,
     add_to_cart_keyboard,
+    cart_keyboard,
     main_menu,
 )
 from app.services import guardrails, llm
@@ -73,6 +77,104 @@ def _extract_price_line(content: str) -> str:
         if re.search(r"(стоимость|цена|₽|\d[\d\s]*000)", stripped, re.IGNORECASE):
             return _strip_md_bold(stripped)
     return ""
+
+
+def _parse_price_amount(price_text: str) -> int | None:
+    """Извлечь сумму из текста цены (например «Стоимость: 15 000 ₽»)."""
+    if not price_text:
+        return None
+    normalized = price_text.replace("\u00a0", " ").replace("\u202f", " ")
+    match = re.search(r"(\d[\d\s]*)", normalized)
+    if not match:
+        return None
+    digits = re.sub(r"\s+", "", match.group(1))
+    if not digits.isdigit():
+        return None
+    return int(digits)
+
+
+def _format_money(amount: int) -> str:
+    """Форматировать сумму с пробелами тысяч: 15000 → «15 000 ₽»."""
+    grouped = f"{amount:,}".replace(",", " ")
+    return f"{grouped} ₽"
+
+
+CART_EMPTY_TEXT = (
+    "Ваша корзина пока пуста.\n"
+    f"Откройте «{BTN_SHOWCASE}», чтобы выбрать услуги."
+)
+
+
+def _format_cart_message(items: list[CartItem]) -> str:
+    """Текст корзины: позиции с ценами и итоговая сумма."""
+    lines = ["Ваша корзина:"]
+    total = 0
+    parsed_any = False
+    for item in items:
+        line = f"• {item.title}"
+        if item.price_text:
+            line += f" — {item.price_text}"
+        lines.append(line)
+        amount = _parse_price_amount(item.price_text)
+        if amount is not None:
+            total += amount
+            parsed_any = True
+    if parsed_any:
+        lines.append(f"\nИтого: {_format_money(total)}")
+    else:
+        lines.append("\nИтого: сумма уточняется при оформлении.")
+    return "\n".join(lines)
+
+
+def _format_order_summary(order_id: int, items: list[CartItem]) -> str:
+    """Сообщение после оформления заказа."""
+    lines = [
+        f"Заказ №{order_id} оформлен.",
+        "Статус: ожидает оплаты.",
+        "",
+        "Состав заказа:",
+    ]
+    total = 0
+    parsed_any = False
+    for item in items:
+        line = f"• {item.title}"
+        if item.price_text:
+            line += f" — {item.price_text}"
+        lines.append(line)
+        amount = _parse_price_amount(item.price_text)
+        if amount is not None:
+            total += amount
+            parsed_any = True
+    if parsed_any:
+        lines.append(f"\nИтого: {_format_money(total)}")
+    else:
+        lines.append("\nИтого: сумма будет уточнена.")
+    lines.append(
+        "\nОплата пока не подключена — эта функция скоро появится. "
+        "Мы сообщим, когда можно будет оплатить заказ."
+    )
+    return "\n".join(lines)
+
+
+async def _safe_edit_message(
+    message: Message,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    """Обновить сообщение корзины; игнорировать «message is not modified».
+
+    None для reply_markup снимает inline-клавиатуру (пустая разметка).
+    """
+    markup = (
+        reply_markup
+        if reply_markup is not None
+        else InlineKeyboardMarkup(inline_keyboard=[])
+    )
+    try:
+        await message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            logger.warning("Не удалось обновить сообщение корзины: %s", exc)
 
 
 def _extract_service_description(content: str) -> str:
@@ -314,27 +416,19 @@ async def _send_showcase(message: Message, user_id: int | None) -> None:
 
 
 async def _send_cart(message: Message, user_id: int | None) -> None:
-    """Показать содержимое корзины из БД."""
+    """Показать содержимое корзины из БД с кнопками управления."""
     if user_id is None:
-        reply = "Корзина пуста."
-        await message.answer(reply)
+        await message.answer(CART_EMPTY_TEXT)
         return
 
     items = await persistence.list_cart(user_id)
     if not items:
-        reply = "Корзина пуста."
-        await message.answer(reply)
-        await _log_exchange(user_id, BTN_CART, reply)
+        await message.answer(CART_EMPTY_TEXT)
+        await _log_exchange(user_id, BTN_CART, CART_EMPTY_TEXT)
         return
 
-    lines = ["Ваша корзина:"]
-    for item in items:
-        line = f"• {item.title}"
-        if item.price_text:
-            line += f" — {item.price_text}"
-        lines.append(line)
-    reply = "\n".join(lines)
-    await message.answer(reply)
+    reply = _format_cart_message(items)
+    await message.answer(reply, reply_markup=cart_keyboard(items))
     await _log_exchange(user_id, BTN_CART, reply)
 
 
@@ -474,11 +568,87 @@ async def on_add_to_cart(callback: CallbackQuery) -> None:
         reply = f"Добавлено в корзину: {title}"
         if price_text:
             reply += f" ({price_text})"
+        await callback.answer(reply)
     else:
         reply = f"Уже в корзине: {title}"
+        await callback.answer(reply, show_alert=True)
 
-    await callback.answer(reply, show_alert=True)
     await _log_exchange(user_id, user_action, reply)
+
+
+@router.callback_query(F.data.startswith("cart:remove:"))
+async def on_remove_from_cart(callback: CallbackQuery) -> None:
+    """Убрать позицию из корзины и обновить сообщение."""
+    user_id = await _ensure_user(callback.from_user)
+    if user_id is None:
+        await callback.answer("Не удалось определить пользователя", show_alert=True)
+        return
+
+    raw = (callback.data or "").removeprefix("cart:remove:")
+    try:
+        cart_item_id = int(raw)
+    except ValueError:
+        await callback.answer("Позиция не найдена", show_alert=True)
+        return
+
+    removed = await persistence.remove_from_cart(user_id, cart_item_id)
+    if removed:
+        await callback.answer("Убрано")
+        user_action = f"{BTN_REMOVE}: #{cart_item_id}"
+        log_reply = "Позиция убрана из корзины."
+    else:
+        await callback.answer("Позиция уже удалена")
+        user_action = f"{BTN_REMOVE}: #{cart_item_id}"
+        log_reply = "Позиция уже была удалена."
+
+    items = await persistence.list_cart(user_id)
+    message = callback.message
+    if message is None or not isinstance(message, Message):
+        await _log_exchange(user_id, user_action, log_reply)
+        return
+
+    if not items:
+        await _safe_edit_message(message, CART_EMPTY_TEXT, reply_markup=None)
+        await _log_exchange(user_id, user_action, CART_EMPTY_TEXT)
+        return
+
+    reply = _format_cart_message(items)
+    await _safe_edit_message(message, reply, reply_markup=cart_keyboard(items))
+    await _log_exchange(user_id, user_action, reply)
+
+
+@router.callback_query(F.data == "cart:checkout")
+async def on_checkout(callback: CallbackQuery) -> None:
+    """Оформить заказ из корзины (статус «ожидает оплаты»)."""
+    user_id = await _ensure_user(callback.from_user)
+    if user_id is None:
+        await callback.answer("Не удалось определить пользователя", show_alert=True)
+        return
+
+    result = await persistence.checkout_cart(user_id)
+    message = callback.message
+
+    if result is None:
+        await callback.answer("Корзина пуста", show_alert=True)
+        if message is not None and isinstance(message, Message):
+            await _safe_edit_message(message, CART_EMPTY_TEXT, reply_markup=None)
+        await _log_exchange(user_id, BTN_CHECKOUT, CART_EMPTY_TEXT)
+        return
+
+    order_id, items = result
+    summary = _format_order_summary(order_id, items)
+    await callback.answer("Заказ оформлен")
+
+    if message is not None and isinstance(message, Message):
+        await _safe_edit_message(
+            message,
+            f"Заказ №{order_id} оформлен. Корзина очищена.",
+            reply_markup=None,
+        )
+
+    if callback.message is not None:
+        await callback.message.answer(summary)
+    await _log_exchange(user_id, BTN_CHECKOUT, summary)
 
 
 @router.message(F.text)
