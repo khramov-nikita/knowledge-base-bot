@@ -8,12 +8,18 @@ import re
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, Message, User
 
 from app import runtime
-from app.database import queries
-from app.keyboards import BTN_CONTACT_HUMAN, BTN_HELP, main_menu
+from app.database import persistence, queries
+from app.keyboards import (
+    BTN_ADD_TO_CART,
+    BTN_CART,
+    BTN_CONTACT_HUMAN,
+    BTN_SHOWCASE,
+    add_to_cart_keyboard,
+    main_menu,
+)
 from app.services import guardrails, llm
 from app.services.notifier import notify_contact_request, notify_unanswered
 from app.utils.formatting import bold, md_to_telegram_html
@@ -30,10 +36,6 @@ HELP_TEXT = (
     "/start — начать\n"
     "/help — справка"
 )
-
-# Память диалога в FSM-контексте: последние сообщения (вопросы и ответы).
-_HISTORY_KEY = "history"
-_HISTORY_LIMIT = 20
 
 
 def _short_title(title: str) -> str:
@@ -57,13 +59,53 @@ def _context_title(title: str) -> str:
     return f"{short}{paren}".strip()
 
 
+def _strip_md_bold(text: str) -> str:
+    """Убрать markdown-жирный из одной строки (в т.ч. вид **Цель:** …)."""
+    cleaned = text.strip()
+    cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
+    return cleaned.replace("**", "").strip()
+
+
 def _extract_price_line(content: str) -> str:
     """Достать строку со стоимостью из текста записи, если есть."""
     for line in content.splitlines():
         stripped = line.strip()
         if re.search(r"(стоимость|цена|₽|\d[\d\s]*000)", stripped, re.IGNORECASE):
-            return re.sub(r"^\*\*?|\*\*?$", "", stripped).strip()
+            return _strip_md_bold(stripped)
     return ""
+
+
+def _extract_service_description(content: str) -> str:
+    """Короткое описание услуги: строка «Цель», иначе начало текста без цены."""
+    for line in content.splitlines():
+        stripped = _strip_md_bold(line)
+        match = re.match(r"^Цель:\s*(.+)$", stripped, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    for line in content.splitlines():
+        stripped = _strip_md_bold(line)
+        if not stripped:
+            continue
+        if re.search(r"(стоимость|цена|₽)", stripped, re.IGNORECASE):
+            continue
+        if stripped.lower().startswith("стек"):
+            continue
+        return stripped
+    return ""
+
+
+def _format_service_card(item: queries.KnowledgeItem) -> str:
+    """HTML-карточка услуги для витрины."""
+    title = bold(_short_title(item.title))
+    description = _extract_service_description(item.content)
+    price = _extract_price_line(item.content)
+    parts = [title]
+    if description:
+        parts.append(md_to_telegram_html(description))
+    if price:
+        parts.append(md_to_telegram_html(price))
+    return "\n".join(parts)
 
 
 def _line_match_score(line: str, words: list[str]) -> int:
@@ -222,6 +264,21 @@ def _owner_id() -> int:
     return runtime.OWNER_ID
 
 
+async def _ensure_user(user: User | None) -> int | None:
+    """Зарегистрировать/обновить пользователя в БД. Возвращает telegram_id."""
+    if user is None:
+        return None
+    await persistence.upsert_user(user.id, user.username, user.full_name)
+    return user.id
+
+
+async def _log_exchange(user_id: int | None, user_text: str, assistant_text: str) -> None:
+    """Сохранить пару реплик в историю диалога (для контекста LLM)."""
+    if user_id is None:
+        return
+    await persistence.append_dialog_exchange(user_id, user_text, assistant_text)
+
+
 async def _send_help(message: Message) -> None:
     items = await queries.list_knowledge(limit=50)
     text = HELP_TEXT
@@ -233,7 +290,55 @@ async def _send_help(message: Message) -> None:
     await message.answer(text)
 
 
-async def _send_contact_human(message: Message) -> None:
+async def _send_showcase(message: Message, user_id: int | None) -> None:
+    """Показать карточки услуг из базы знаний."""
+    services = await queries.list_catalog_services()
+    if not services:
+        reply = "Пока нет услуг для отображения."
+        await message.answer(reply)
+        await _log_exchange(user_id, BTN_SHOWCASE, reply)
+        return
+
+    await message.answer("Наши услуги:")
+    summary_lines: list[str] = ["Наши услуги:"]
+    for item in services:
+        await message.answer(
+            _format_service_card(item),
+            reply_markup=add_to_cart_keyboard(item.id),
+        )
+        title = _short_title(item.title)
+        price = _extract_price_line(item.content)
+        summary_lines.append(f"• {title}" + (f" — {price}" if price else ""))
+
+    await _log_exchange(user_id, BTN_SHOWCASE, "\n".join(summary_lines))
+
+
+async def _send_cart(message: Message, user_id: int | None) -> None:
+    """Показать содержимое корзины из БД."""
+    if user_id is None:
+        reply = "Корзина пуста."
+        await message.answer(reply)
+        return
+
+    items = await persistence.list_cart(user_id)
+    if not items:
+        reply = "Корзина пуста."
+        await message.answer(reply)
+        await _log_exchange(user_id, BTN_CART, reply)
+        return
+
+    lines = ["Ваша корзина:"]
+    for item in items:
+        line = f"• {item.title}"
+        if item.price_text:
+            line += f" — {item.price_text}"
+        lines.append(line)
+    reply = "\n".join(lines)
+    await message.answer(reply)
+    await _log_exchange(user_id, BTN_CART, reply)
+
+
+async def _send_contact_human(message: Message, user_id: int | None) -> None:
     """Уведомляем владельца (если это не он сам) и отправляем контакты пользователю."""
     user = message.from_user
     if user is not None and user.id != runtime.OWNER_ID:
@@ -246,22 +351,21 @@ async def _send_contact_human(message: Message) -> None:
         )
 
     contact = runtime.OWNER_CONTACT or "контакты не указаны"
-    await message.answer(
+    reply = (
         "Ваш запрос передан. С вами свяжется человек.\n\n"
         f"Наши контакты: {contact}"
     )
+    await message.answer(reply)
+    await _log_exchange(user_id, BTN_CONTACT_HUMAN, reply)
 
 
-async def _handle_knowledge_query(
-    message: Message,
-    state: FSMContext,
-    query: str,
-) -> None:
+async def _handle_knowledge_query(message: Message, query: str) -> None:
     """Обработка текстовых запросов к базе знаний (Сценарии 1-3)."""
     user_id = message.from_user.id if message.from_user else 0
-
-    data = await state.get_data()
-    history: list[dict[str, str]] = data.get(_HISTORY_KEY, [])
+    history = await persistence.get_recent_dialog(
+        user_id,
+        limit=persistence.DIALOG_HISTORY_LIMIT,
+    )
 
     targeted = await queries.search_knowledge(query)
     context_items = await queries.select_context_for_query(query)
@@ -273,11 +377,13 @@ async def _handle_knowledge_query(
     reply_text = ""
     answered = False
 
-    if llm.is_enabled() and context_items:
-        knowledge = _compact_knowledge(
-            context_items,
-            query,
-            detailed=detailed,
+    # LLM нужна и при пустой выборке из БЗ, если есть история диалога
+    # (вопросы вроде «о чём мы говорили?», «что в корзине?»).
+    if llm.is_enabled() and (context_items or history):
+        knowledge = (
+            _compact_knowledge(context_items, query, detailed=detailed)
+            if context_items
+            else []
         )
         llm_answer = await llm.answer(query, knowledge, history=history)
         if llm_answer is not None and not llm.is_no_answer(llm_answer):
@@ -291,6 +397,17 @@ async def _handle_knowledge_query(
             if snippets:
                 reply_text = "\n\n".join(snippets)
                 await _safe_answer(message, md_to_telegram_html(reply_text))
+                answered = True
+        elif history and (llm_answer is None or llm.is_no_answer(llm_answer)):
+            # Fallback: кратко напомнить последние реплики бота из истории.
+            recent = [
+                m["content"]
+                for m in history
+                if m.get("role") == "assistant" and m.get("content")
+            ]
+            if recent:
+                reply_text = "Недавно в диалоге:\n" + "\n\n".join(recent[-3:])
+                await message.answer(reply_text)
                 answered = True
     elif targeted:
         reply_text = _plain_items(targeted)
@@ -309,15 +426,13 @@ async def _handle_knowledge_query(
             await message.answer(reply_text)
 
     await queries.log_query(user_id, query, answered)
-
-    history.append({"role": "user", "content": query})
-    history.append({"role": "assistant", "content": reply_text})
-    await state.update_data({_HISTORY_KEY: history[-_HISTORY_LIMIT:]})
+    await persistence.append_dialog_exchange(user_id, query, reply_text)
 
 
 @router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    await state.clear()
+async def cmd_start(message: Message) -> None:
+    # Историю диалога и корзину не сбрасываем — только upsert пользователя.
+    await _ensure_user(message.from_user)
     await message.answer(
         "Здравствуйте! " + HELP_TEXT,
         reply_markup=main_menu(),
@@ -326,22 +441,65 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
+    await _ensure_user(message.from_user)
     await _send_help(message)
 
 
+@router.callback_query(F.data.startswith("cart:add:"))
+async def on_add_to_cart(callback: CallbackQuery) -> None:
+    """Добавить услугу в корзину (без дублей)."""
+    user_id = await _ensure_user(callback.from_user)
+    raw = (callback.data or "").removeprefix("cart:add:")
+    try:
+        service_id = int(raw)
+    except ValueError:
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+
+    item = await queries.get_knowledge_by_id(service_id)
+    if item is None:
+        await callback.answer("Услуга не найдена", show_alert=True)
+        return
+
+    title = _short_title(item.title)
+    price_text = _extract_price_line(item.content)
+    user_action = f"{BTN_ADD_TO_CART}: {title}"
+
+    if user_id is None:
+        await callback.answer("Не удалось определить пользователя", show_alert=True)
+        return
+
+    added = await persistence.add_to_cart(user_id, service_id, title, price_text)
+    if added:
+        reply = f"Добавлено в корзину: {title}"
+        if price_text:
+            reply += f" ({price_text})"
+    else:
+        reply = f"Уже в корзине: {title}"
+
+    await callback.answer(reply, show_alert=True)
+    await _log_exchange(user_id, user_action, reply)
+
+
 @router.message(F.text)
-async def dispatch_text(message: Message, state: FSMContext) -> None:
+async def dispatch_text(message: Message) -> None:
     """Единая точка входа для всего текста — один ответ на одно сообщение."""
     query = (message.text or "").strip()
     if not query or query.startswith("/"):
         return
 
-    if query == BTN_HELP:
-        await _send_help(message)
+    user_id = await _ensure_user(message.from_user)
+
+    if query == BTN_SHOWCASE:
+        await _send_showcase(message, user_id)
+        return
+
+    if query == BTN_CART:
+        await _send_cart(message, user_id)
         return
 
     if query == BTN_CONTACT_HUMAN:
-        await _send_contact_human(message)
+        await _send_contact_human(message, user_id)
         return
 
-    await _handle_knowledge_query(message, state, query)
+    await _handle_knowledge_query(message, query)

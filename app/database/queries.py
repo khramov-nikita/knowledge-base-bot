@@ -281,3 +281,44 @@ async def list_knowledge(limit: int = 20) -> list[KnowledgeItem]:
         )
         rows = await cursor.fetchall()
     return [KnowledgeItem(id=r[0], keywords=r[1], title=r[2], content=r[3]) for r in rows]
+
+
+async def get_knowledge_by_id(item_id: int) -> KnowledgeItem | None:
+    """Одна запись базы знаний по id."""
+    async with get_connection() as db:
+        cursor = await db.execute(
+            "SELECT id, keywords, title, content FROM knowledge WHERE id = ?",
+            (item_id,),
+        )
+        row = await cursor.fetchone()
+    if row is None:
+        return None
+    return KnowledgeItem(id=row[0], keywords=row[1], title=row[2], content=row[3])
+
+
+# Маркеры записей-услуг для витрины (портфолио / сборка).
+_CATALOG_INCLUDE_MARKERS = ("портфолио", "сборк")
+# Агрегатный прайс и профильные разделы в витрину не попадают.
+_CATALOG_EXCLUDE_TITLE = ("стоимость услуг", "прайс", "цены")
+
+
+async def list_catalog_services(limit: int = 50) -> list[KnowledgeItem]:
+    """Услуги для витрины: отдельные карточки портфолио с ценой.
+
+    Берём записи с маркерами портфолио/сборки, у которых в тексте есть цена.
+    Агрегатный раздел «Стоимость услуг» и профильные блоки исключаем.
+    """
+    items = await list_knowledge(limit=limit)
+    services: list[KnowledgeItem] = []
+    for item in items:
+        title_kw = f"{item.keywords} {item.title}".lower()
+        title_lower = item.title.lower()
+        if not any(m in title_kw for m in _CATALOG_INCLUDE_MARKERS):
+            continue
+        if any(m in title_lower for m in _CATALOG_EXCLUDE_TITLE):
+            continue
+        content_lower = item.content.lower()
+        if "₽" not in item.content and "стоимость" not in content_lower:
+            continue
+        services.append(item)
+    return services

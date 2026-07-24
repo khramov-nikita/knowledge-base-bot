@@ -49,6 +49,52 @@ CREATE TABLE IF NOT EXISTS query_log (
     found INTEGER NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    telegram_id INTEGER PRIMARY KEY,
+    username TEXT,
+    full_name TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS cart_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    service_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    price_text TEXT NOT NULL DEFAULT '',
+    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(user_id, service_id)
+);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS order_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    order_id INTEGER NOT NULL,
+    service_id INTEGER,
+    title TEXT NOT NULL,
+    price_text TEXT NOT NULL DEFAULT '',
+    quantity INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS dialog_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_dialog_user_id
+    ON dialog_messages(user_id, id);
 """
 
 
