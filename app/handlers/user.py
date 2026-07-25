@@ -434,7 +434,6 @@ async def _send_contact_human(message: Message, user_id: int | None) -> None:
         await notify_contact_request(
             message.bot,
             runtime.OWNER_ID,
-            user.id,
             user.full_name,
             user.username,
         )
