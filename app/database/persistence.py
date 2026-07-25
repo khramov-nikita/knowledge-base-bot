@@ -29,6 +29,25 @@ class OrderItemInput:
     quantity: int = 1
 
 
+@dataclass
+class OrderItem:
+    id: int
+    order_id: int
+    service_id: int | None
+    title: str
+    price_text: str
+    quantity: int
+
+
+@dataclass
+class Order:
+    id: int
+    user_id: int
+    status: str
+    payment_id: str | None
+    items: list[OrderItem]
+
+
 async def upsert_user(
     telegram_id: int,
     username: str | None,
@@ -204,18 +223,98 @@ async def checkout_cart(
         return order_id, items
 
 
-async def set_order_status(order_id: int, status: str) -> None:
-    """Обновить статус заказа (под будущую оплату)."""
+async def get_order_for_user(order_id: int, user_id: int) -> Order | None:
+    """Заказ пользователя с позициями. None — нет или чужой."""
+    async with get_connection() as db:
+        cursor = await db.execute(
+            """
+            SELECT id, user_id, status, payment_id
+            FROM orders
+            WHERE id = ? AND user_id = ?
+            """,
+            (order_id, user_id),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+
+        items_cursor = await db.execute(
+            """
+            SELECT id, order_id, service_id, title, price_text, quantity
+            FROM order_items
+            WHERE order_id = ?
+            ORDER BY id
+            """,
+            (order_id,),
+        )
+        item_rows = await items_cursor.fetchall()
+
+    items = [
+        OrderItem(
+            id=r[0],
+            order_id=r[1],
+            service_id=r[2],
+            title=r[3],
+            price_text=r[4] or "",
+            quantity=r[5] or 1,
+        )
+        for r in item_rows
+    ]
+    return Order(
+        id=row[0],
+        user_id=row[1],
+        status=row[2],
+        payment_id=row[3],
+        items=items,
+    )
+
+
+async def set_order_payment(order_id: int, payment_id: str) -> None:
+    """Сохранить id платежа ЮKassa для заказа."""
     async with get_connection() as db:
         await db.execute(
             """
             UPDATE orders
-            SET status = ?, updated_at = datetime('now')
+            SET payment_id = ?, updated_at = datetime('now')
             WHERE id = ?
             """,
-            (status, order_id),
+            (payment_id, order_id),
         )
         await db.commit()
+
+
+async def set_order_status(
+    order_id: int,
+    status: str,
+    *,
+    only_if_status: str | None = None,
+) -> bool:
+    """Обновить статус заказа. True — строка обновлена.
+
+    Если only_if_status задан, меняем только при совпадении текущего статуса
+    (защита от гонки повторного «Я оплатил»).
+    """
+    async with get_connection() as db:
+        if only_if_status is None:
+            cursor = await db.execute(
+                """
+                UPDATE orders
+                SET status = ?, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (status, order_id),
+            )
+        else:
+            cursor = await db.execute(
+                """
+                UPDATE orders
+                SET status = ?, updated_at = datetime('now')
+                WHERE id = ? AND status = ?
+                """,
+                (status, order_id, only_if_status),
+            )
+        await db.commit()
+        return (cursor.rowcount or 0) > 0
 
 
 async def append_dialog(user_id: int, role: str, content: str) -> None:

@@ -18,15 +18,25 @@ from app.keyboards import (
     BTN_CART,
     BTN_CHECKOUT,
     BTN_CONTACT_HUMAN,
+    BTN_PAID,
+    BTN_PAY,
     BTN_REMOVE,
     BTN_SHOWCASE,
     add_to_cart_keyboard,
     cart_keyboard,
     main_menu,
+    order_pay_keyboard,
+    order_payment_keyboard,
 )
 from app.services import guardrails, llm
-from app.services.notifier import notify_contact_request, notify_unanswered
+from app.services import yookassa_payments
+from app.services.notifier import (
+    notify_contact_request,
+    notify_paid_order,
+    notify_unanswered,
+)
 from app.utils.formatting import bold, md_to_telegram_html
+from app.utils.pricing import format_money, total_from_price_texts
 
 logger = logging.getLogger(__name__)
 
@@ -79,81 +89,66 @@ def _extract_price_line(content: str) -> str:
     return ""
 
 
-def _parse_price_amount(price_text: str) -> int | None:
-    """Извлечь сумму из текста цены (например «Стоимость: 15 000 ₽»)."""
-    if not price_text:
-        return None
-    normalized = price_text.replace("\u00a0", " ").replace("\u202f", " ")
-    match = re.search(r"(\d[\d\s]*)", normalized)
-    if not match:
-        return None
-    digits = re.sub(r"\s+", "", match.group(1))
-    if not digits.isdigit():
-        return None
-    return int(digits)
-
-
-def _format_money(amount: int) -> str:
-    """Форматировать сумму с пробелами тысяч: 15000 → «15 000 ₽»."""
-    grouped = f"{amount:,}".replace(",", " ")
-    return f"{grouped} ₽"
-
-
 CART_EMPTY_TEXT = (
     "Ваша корзина пока пуста.\n"
     f"Откройте «{BTN_SHOWCASE}», чтобы выбрать услуги."
 )
 
+ORDER_STATUS_AWAITING = "ожидает оплаты"
+ORDER_STATUS_PAID = "оплачен"
+
 
 def _format_cart_message(items: list[CartItem]) -> str:
     """Текст корзины: позиции с ценами и итоговая сумма."""
     lines = ["Ваша корзина:"]
-    total = 0
-    parsed_any = False
     for item in items:
         line = f"• {item.title}"
         if item.price_text:
             line += f" — {item.price_text}"
         lines.append(line)
-        amount = _parse_price_amount(item.price_text)
-        if amount is not None:
-            total += amount
-            parsed_any = True
-    if parsed_any:
-        lines.append(f"\nИтого: {_format_money(total)}")
+    total = total_from_price_texts([item.price_text for item in items])
+    if total is not None:
+        lines.append(f"\nИтого: {format_money(total)}")
     else:
         lines.append("\nИтого: сумма уточняется при оформлении.")
     return "\n".join(lines)
 
 
-def _format_order_summary(order_id: int, items: list[CartItem]) -> str:
-    """Сообщение после оформления заказа."""
+def _format_order_summary(order_id: int, items: list[CartItem]) -> tuple[str, int | None]:
+    """Сообщение после оформления заказа и распознанная сумма (если есть)."""
     lines = [
         f"Заказ №{order_id} оформлен.",
-        "Статус: ожидает оплаты.",
+        f"Статус: {ORDER_STATUS_AWAITING}.",
         "",
         "Состав заказа:",
     ]
-    total = 0
-    parsed_any = False
     for item in items:
         line = f"• {item.title}"
         if item.price_text:
             line += f" — {item.price_text}"
         lines.append(line)
-        amount = _parse_price_amount(item.price_text)
-        if amount is not None:
-            total += amount
-            parsed_any = True
-    if parsed_any:
-        lines.append(f"\nИтого: {_format_money(total)}")
+    total = total_from_price_texts([item.price_text for item in items])
+    if total is not None:
+        lines.append(f"\nИтого: {format_money(total)}")
+        lines.append("\nНажмите «Оплатить», чтобы перейти к оплате.")
     else:
         lines.append("\nИтого: сумма будет уточнена.")
-    lines.append(
-        "\nОплата пока не подключена — эта функция скоро появится. "
-        "Мы сообщим, когда можно будет оплатить заказ."
-    )
-    return "\n".join(lines)
+        lines.append(
+            "\nОнлайн-оплата недоступна: не удалось определить сумму. "
+            "Свяжитесь с исполнителем."
+        )
+    return "\n".join(lines), total
+
+
+def _payment_return_url() -> str:
+    username = runtime.BOT_USERNAME
+    if username:
+        return f"https://t.me/{username}"
+    return "https://t.me/"
+
+
+def _order_total_rub(order: persistence.Order) -> int | None:
+    return total_from_price_texts([item.price_text for item in order.items])
 
 
 async def _safe_edit_message(
@@ -636,7 +631,8 @@ async def on_checkout(callback: CallbackQuery) -> None:
         return
 
     order_id, items = result
-    summary = _format_order_summary(order_id, items)
+    summary, total = _format_order_summary(order_id, items)
+    pay_markup = order_pay_keyboard(order_id) if total is not None else None
     await callback.answer("Заказ оформлен")
 
     if message is not None and isinstance(message, Message):
@@ -647,8 +643,199 @@ async def on_checkout(callback: CallbackQuery) -> None:
         )
 
     if callback.message is not None:
-        await callback.message.answer(summary)
+        await callback.message.answer(summary, reply_markup=pay_markup)
     await _log_exchange(user_id, BTN_CHECKOUT, summary)
+
+
+@router.callback_query(F.data.startswith("pay:create:"))
+async def on_pay_create(callback: CallbackQuery) -> None:
+    """Создать платёж ЮKassa (или переиспользовать активный) и отправить ссылку."""
+    user_id = await _ensure_user(callback.from_user)
+    if user_id is None:
+        await callback.answer("Не удалось определить пользователя", show_alert=True)
+        return
+
+    raw = (callback.data or "").removeprefix("pay:create:")
+    try:
+        order_id = int(raw)
+    except ValueError:
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+
+    order = await persistence.get_order_for_user(order_id, user_id)
+    if order is None:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    if order.status == ORDER_STATUS_PAID:
+        await callback.answer("Заказ уже оплачен", show_alert=True)
+        return
+
+    if order.status != ORDER_STATUS_AWAITING:
+        await callback.answer("Этот заказ нельзя оплатить", show_alert=True)
+        return
+
+    amount = _order_total_rub(order)
+    if amount is None or amount <= 0:
+        await callback.answer(
+            "Не удалось определить сумму заказа",
+            show_alert=True,
+        )
+        return
+
+    payment_url: str | None = None
+    try:
+        if order.payment_id:
+            existing = await yookassa_payments.get_payment(order.payment_id)
+            if existing.status == "succeeded":
+                updated = await persistence.set_order_status(
+                    order_id,
+                    ORDER_STATUS_PAID,
+                    only_if_status=ORDER_STATUS_AWAITING,
+                )
+                if updated and callback.from_user is not None:
+                    if callback.from_user.id != runtime.OWNER_ID:
+                        await notify_paid_order(
+                            callback.bot,
+                            runtime.OWNER_ID,
+                            callback.from_user.id,
+                            callback.from_user.full_name,
+                            callback.from_user.username,
+                            order_id,
+                            format_money(amount),
+                        )
+                await callback.answer("Заказ уже оплачен", show_alert=True)
+                if callback.message is not None:
+                    await callback.message.answer(
+                        f"Заказ №{order_id} уже оплачен. Спасибо!"
+                    )
+                return
+            if yookassa_payments.is_active_payment(existing.status):
+                payment_url = existing.confirmation_url
+
+        if not payment_url:
+            created = await yookassa_payments.create_payment(
+                order_id,
+                amount,
+                _payment_return_url(),
+            )
+            await persistence.set_order_payment(order_id, created.payment_id)
+            payment_url = created.confirmation_url
+    except yookassa_payments.YooKassaAuthError:
+        await callback.answer(
+            "Ошибка ключей ЮKassa. Проверьте YOOKASSA_SHOP_ID и "
+            "YOOKASSA_SECRET_KEY в .env (полный ключ без «*»).",
+            show_alert=True,
+        )
+        return
+    except Exception:  # noqa: BLE001 — не ломаем диалог из‑за API
+        await callback.answer(
+            "Не удалось создать платёж. Попробуйте позже.",
+            show_alert=True,
+        )
+        return
+
+    if not payment_url:
+        await callback.answer(
+            "Не удалось получить ссылку на оплату",
+            show_alert=True,
+        )
+        return
+
+    reply = (
+        f"Оплата заказа №{order_id} на сумму {format_money(amount)}.\n\n"
+        "Откройте страницу оплаты по кнопке ниже. "
+        "После оплаты нажмите «Я оплатил»."
+    )
+    await callback.answer()
+    if callback.message is not None:
+        await callback.message.answer(
+            reply,
+            reply_markup=order_payment_keyboard(order_id, payment_url),
+        )
+    await _log_exchange(user_id, BTN_PAY, reply)
+
+
+@router.callback_query(F.data.startswith("pay:check:"))
+async def on_pay_check(callback: CallbackQuery) -> None:
+    """Проверить статус платежа в ЮKassa по кнопке «Я оплатил»."""
+    user_id = await _ensure_user(callback.from_user)
+    if user_id is None:
+        await callback.answer("Не удалось определить пользователя", show_alert=True)
+        return
+
+    raw = (callback.data or "").removeprefix("pay:check:")
+    try:
+        order_id = int(raw)
+    except ValueError:
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+
+    order = await persistence.get_order_for_user(order_id, user_id)
+    if order is None:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+
+    amount = _order_total_rub(order)
+    amount_text = format_money(amount) if amount is not None else "—"
+
+    if order.status == ORDER_STATUS_PAID:
+        await callback.answer("Заказ уже оплачен")
+        if callback.message is not None:
+            await callback.message.answer(
+                f"Заказ №{order_id} уже оплачен. Спасибо!"
+            )
+        return
+
+    if not order.payment_id:
+        await callback.answer(
+            "Сначала нажмите «Оплатить», чтобы получить ссылку.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        payment = await yookassa_payments.get_payment(order.payment_id)
+    except Exception:  # noqa: BLE001
+        await callback.answer(
+            "Не удалось проверить оплату. Попробуйте позже.",
+            show_alert=True,
+        )
+        return
+
+    if payment.status == "succeeded":
+        updated = await persistence.set_order_status(
+            order_id,
+            ORDER_STATUS_PAID,
+            only_if_status=ORDER_STATUS_AWAITING,
+        )
+        reply = (
+            f"Спасибо! Заказ №{order_id} оплачен.\n"
+            f"Сумма: {amount_text}."
+        )
+        await callback.answer("Оплата подтверждена")
+        if callback.message is not None:
+            await callback.message.answer(reply)
+        if updated and callback.from_user is not None:
+            if callback.from_user.id != runtime.OWNER_ID:
+                await notify_paid_order(
+                    callback.bot,
+                    runtime.OWNER_ID,
+                    callback.from_user.id,
+                    callback.from_user.full_name,
+                    callback.from_user.username,
+                    order_id,
+                    amount_text,
+                )
+        await _log_exchange(user_id, BTN_PAID, reply)
+        return
+
+    reply = (
+        "Оплата ещё не поступила. "
+        "Завершите оплату по ссылке и нажмите «Я оплатил» снова."
+    )
+    await callback.answer(reply, show_alert=True)
+    await _log_exchange(user_id, BTN_PAID, reply)
 
 
 @router.message(F.text)

@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'new',
+    payment_id TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -98,6 +99,20 @@ CREATE INDEX IF NOT EXISTS idx_dialog_user_id
 """
 
 
+async def _ensure_column(
+    db: aiosqlite.Connection,
+    table: str,
+    column: str,
+    definition: str,
+) -> None:
+    """Добавить колонку в существующую таблицу, если её ещё нет."""
+    cursor = await db.execute(f"PRAGMA table_info({table})")
+    rows = await cursor.fetchall()
+    existing = {row[1] for row in rows}
+    if column not in existing:
+        await db.execute(f"ALTER TABLE {table} ADD COLUMN {definition}")
+
+
 async def init_db() -> None:
     """Создать таблицы, если их ещё нет, и папку для файла БД."""
     directory = os.path.dirname(_DB_PATH)
@@ -106,4 +121,5 @@ async def init_db() -> None:
 
     async with get_connection() as db:
         await db.executescript(_SCHEMA)
+        await _ensure_column(db, "orders", "payment_id", "payment_id TEXT")
         await db.commit()

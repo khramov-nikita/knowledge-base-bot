@@ -25,15 +25,24 @@ async def main() -> None:
     config = load_config()
     runtime.set_owner_id(config.owner_id)
     runtime.set_owner_contact(config.owner_contact)
+    runtime.set_yookassa(config.yookassa_shop_id, config.yookassa_secret_key)
 
     db.configure(config.db_path)
     await db.init_db()
     logger.info("База данных инициализирована: %s", config.db_path)
 
+    from app.services import yookassa_payments
+
+    yookassa_payments.configure(config.yookassa_shop_id, config.yookassa_secret_key)
+
     bot = Bot(
         token=config.bot_token,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    me = await bot.get_me()
+    if me.username:
+        runtime.set_bot_username(me.username)
+
     dp = Dispatcher(storage=MemoryStorage())
     register_routers(dp)
 

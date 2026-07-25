@@ -46,3 +46,25 @@ async def notify_contact_request(
         f"ID: {user_id}"
     )
     await notify_owner(bot, owner_id, text)
+
+
+async def notify_paid_order(
+    bot: Bot,
+    owner_id: int,
+    user_id: int,
+    full_name: str,
+    username: str | None,
+    order_id: int,
+    amount_text: str,
+) -> None:
+    """Уведомить владельца о новом оплаченном заказе."""
+    username_line = f"@{username}" if username else "—"
+    text = (
+        "Новый оплаченный заказ\n\n"
+        f"Заказ: №{order_id}\n"
+        f"Сумма: {amount_text}\n\n"
+        f"Имя: {full_name}\n"
+        f"Username: {username_line}\n"
+        f"ID: {user_id}"
+    )
+    await notify_owner(bot, owner_id, text)

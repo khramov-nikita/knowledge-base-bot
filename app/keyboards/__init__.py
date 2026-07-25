@@ -18,6 +18,9 @@ BTN_CONTACT_HUMAN = "Связаться с человеком"
 BTN_ADD_TO_CART = "Добавить в корзину"
 BTN_REMOVE = "Убрать"
 BTN_CHECKOUT = "Оформить заказ"
+BTN_PAY = "Оплатить"
+BTN_PAID = "Я оплатил"
+BTN_OPEN_PAYMENT = "Перейти к оплате"
 
 
 class _CartKeyboardItem(Protocol):
@@ -75,3 +78,32 @@ def cart_keyboard(items: list[_CartKeyboardItem]) -> InlineKeyboardMarkup:
         ]
     )
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def order_pay_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    """Кнопка «Оплатить» под оформленным заказом."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=BTN_PAY,
+                    callback_data=f"pay:create:{order_id}",
+                )
+            ]
+        ]
+    )
+
+
+def order_payment_keyboard(order_id: int, payment_url: str) -> InlineKeyboardMarkup:
+    """Ссылка на оплату и кнопка «Я оплатил»."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=BTN_OPEN_PAYMENT, url=payment_url)],
+            [
+                InlineKeyboardButton(
+                    text=BTN_PAID,
+                    callback_data=f"pay:check:{order_id}",
+                )
+            ],
+        ]
+    )
