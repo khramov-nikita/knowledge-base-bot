@@ -33,17 +33,15 @@ async def notify_unanswered(bot: Bot, owner_id: int, user_id: int, query: str) -
 async def notify_contact_request(
     bot: Bot,
     owner_id: int,
-    user_id: int,
     full_name: str,
     username: str | None,
 ) -> None:
     """Уведомить владельца о том, что пользователь хочет связаться с человеком."""
-    username_line = f"@{username}" if username else "—"
+    contact_line = f"@{username}" if username else "username не указан"
     text = (
         "Пользователь хочет связаться с человеком\n\n"
         f"Имя: {full_name}\n"
-        f"Username: {username_line}\n"
-        f"ID: {user_id}"
+        f"Контакт: {contact_line}"
     )
     await notify_owner(bot, owner_id, text)
 
